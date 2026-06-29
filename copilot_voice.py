@@ -99,6 +99,7 @@ def config_dir():
 
 CONFIG_DIR = config_dir()
 OAUTH_CACHE = os.path.join(CONFIG_DIR, "account.json")
+CATALOG_CACHE = os.path.join(CONFIG_DIR, "models_cache.json")
 MODEL_DIR = os.path.join(CONFIG_DIR, "models", MODEL_NAME)
 
 
@@ -152,6 +153,7 @@ def copilot_headers(token):
         "Content-Type": "application/json",
         "Copilot-Integration-Id": "vscode-chat",
         "Editor-Version": EDITOR_VERSION,
+        "User-Agent": "GitHubCopilotChat/0.26.0",
     }
 
 
@@ -360,29 +362,84 @@ def device_login():
 MODEL_ENDPOINTS = {}
 
 
-def get_chat_models():
-    code, r = http_json(CATALOG_URL, headers=copilot_headers(get_bearer()), timeout=40)
-    if not r or "data" not in r:
+def _model_endpoint(m):
+    """Return 'chat'/'responses' if this is a usable picker model, else None."""
+    caps = m.get("capabilities", {}) or {}
+    if caps.get("type") != "chat":
+        return None
+    if not m.get("model_picker_enabled"):
+        return None
+    eps = m.get("supported_endpoints", []) or []
+    if "/chat/completions" in eps:
+        return "chat"
+    if "/responses" in eps:
+        return "responses"
+    return None
+
+
+def _load_cached_catalog():
+    try:
+        with open(CATALOG_CACHE, "r", encoding="utf-8") as f:
+            return (json.load(f) or {}).get("models", []) or []
+    except Exception:
         return []
-    out = []
-    for m in r["data"]:
-        caps = m.get("capabilities", {}) or {}
-        if caps.get("type") != "chat":
-            continue
-        if not m.get("model_picker_enabled"):
-            continue
-        eps = m.get("supported_endpoints", []) or []
-        if "/chat/completions" in eps:
-            ep = "chat"
-        elif "/responses" in eps:
-            ep = "responses"
-        else:
-            continue
-        m["_endpoint"] = ep
-        out.append(m)
+
+
+def _save_cached_catalog(models):
+    try:
+        slim = [{
+            "id": m.get("id"), "name": m.get("name"), "vendor": m.get("vendor"),
+            "capabilities": {"type": "chat"}, "model_picker_enabled": True,
+            "supported_endpoints": m.get("supported_endpoints", []),
+            "_endpoint": m.get("_endpoint"),
+        } for m in models if m.get("id")]
+        with open(CATALOG_CACHE, "w", encoding="utf-8") as f:
+            json.dump({"models": slim, "saved_at": time.time()}, f)
+    except Exception:
+        pass
+
+
+def get_chat_models():
+    # The Copilot catalog API is load-balanced and intermittently returns a
+    # reduced model list (e.g. 6 models instead of the full ~13). Worse, the
+    # chosen backend is "sticky" for several seconds, so rapid retries can all
+    # hit the reduced set. Defenses, combined:
+    #   1) Send a real client User-Agent (urllib's default gets a reduced list).
+    #   2) Fetch a few times, spaced out, and UNION results by id.
+    #   3) Persist a catalog cache to disk and union with it, so once the full
+    #      set has been seen even once it is always shown thereafter.
+    merged = {}
+    for m in _load_cached_catalog():
+        ep = _model_endpoint(m)
+        if ep:
+            m["_endpoint"] = ep
+            merged[m["id"]] = m
+
+    for attempt in range(4):
+        code, r = http_json(CATALOG_URL, headers=copilot_headers(get_bearer()), timeout=40)
+        data = (r or {}).get("data", []) if r else []
+        single = 0
+        for m in data:
+            ep = _model_endpoint(m)
+            if not ep:
+                continue
+            single += 1
+            mid = m.get("id")
+            if mid:
+                m["_endpoint"] = ep
+                merged[mid] = m
+        # A single "rich" live response means we hit the full backend; good enough.
+        if single >= 8:
+            break
+        if attempt < 3:
+            time.sleep(0.6)  # let the sticky backend selection roll over
+
+    out = list(merged.values())
     out.sort(key=lambda x: (str(x.get("vendor", "")), str(x.get("name", ""))))
     for m in out:
         MODEL_ENDPOINTS[m["id"]] = m["_endpoint"]
+    if out:
+        _save_cached_catalog(out)
     return out
 
 
