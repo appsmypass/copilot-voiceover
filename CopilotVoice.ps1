@@ -435,7 +435,7 @@ function Listen($reco) {
 }
 
 function Invoke-CopilotApi($url, $payloadObj) {
-  $payload = $payloadObj | ConvertTo-Json -Depth 8
+  $payload = $payloadObj | ConvertTo-Json -Depth 20
   $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
   for ($attempt = 0; $attempt -lt 2; $attempt++) {
     try {
@@ -450,6 +450,141 @@ function Invoke-CopilotApi($url, $payloadObj) {
       throw
     }
   }
+}
+
+function Get-Tools {
+  # Function/tool schema (chat/completions format). Lets the model DO things.
+  @(
+    @{ type='function'; function=@{ name='run_powershell'
+        description='Run a Windows PowerShell command on the user''s PC and get its output. Use for opening apps (Start-Process msedge), files, system info, automation, installing things, anything. The PC is the user''s own machine.'
+        parameters=@{ type='object'; properties=@{ command=@{ type='string'; description='PowerShell command to run' } }; required=@('command') } } }
+    @{ type='function'; function=@{ name='open'
+        description='Open an app, file, folder, or URL with its default handler (like double-clicking). E.g. msedge, notepad, https://github.com, C:\\Users.'
+        parameters=@{ type='object'; properties=@{ target=@{ type='string'; description='App name, path, or URL' } }; required=@('target') } } }
+    @{ type='function'; function=@{ name='read_file'
+        description='Read a text file and return its contents.'
+        parameters=@{ type='object'; properties=@{ path=@{ type='string' } }; required=@('path') } } }
+    @{ type='function'; function=@{ name='write_file'
+        description='Create or overwrite a text file with content.'
+        parameters=@{ type='object'; properties=@{ path=@{ type='string' }; content=@{ type='string' } }; required=@('path','content') } } }
+    @{ type='function'; function=@{ name='list_dir'
+        description='List files and folders in a directory.'
+        parameters=@{ type='object'; properties=@{ path=@{ type='string' } }; required=@('path') } } }
+  )
+}
+
+function Invoke-Tool($name, $toolArgs) {
+  try {
+    switch ($name) {
+      'run_powershell' {
+        Write-Host "  > $($toolArgs.command)" -ForegroundColor DarkYellow
+        $out = & powershell -NoProfile -ExecutionPolicy Bypass -Command $toolArgs.command 2>&1 | Out-String
+        if ([string]::IsNullOrWhiteSpace($out)) { $out = "(done, no output)" }
+        if ($out.Length -gt 4000) { $out = $out.Substring(0,4000) + "`n...(truncated)" }
+        return $out
+      }
+      'open' {
+        Write-Host "  > open $($toolArgs.target)" -ForegroundColor DarkYellow
+        Start-Process $toolArgs.target | Out-Null; return "Opened $($toolArgs.target)"
+      }
+      'read_file' {
+        if (-not (Test-Path $toolArgs.path)) { return "File not found: $($toolArgs.path)" }
+        $t = Get-Content -Raw $toolArgs.path; if ($t.Length -gt 4000) { $t = $t.Substring(0,4000)+"`n...(truncated)" }; return $t
+      }
+      'write_file' { Set-Content -Path $toolArgs.path -Value $toolArgs.content -Encoding UTF8; return "Wrote $($toolArgs.path)" }
+      'list_dir'   { return ((Get-ChildItem $toolArgs.path -EA SilentlyContinue | Select-Object -First 100 -ExpandProperty Name) -join "`n") }
+      default      { return "Unknown tool $name" }
+    }
+  } catch { return "Error: $($_.Exception.Message)" }
+}
+
+function Get-ToolsResponses {
+  # Same tools, flattened for the /responses endpoint.
+  Get-Tools | ForEach-Object { @{ type='function'; name=$_.function.name; description=$_.function.description; parameters=$_.function.parameters } }
+}
+
+function Invoke-Agent($model, $messages) {
+  # Pick the agent loop that matches how this model is served.
+  $ep = 'chat'
+  if ($script:ModelEndpoints -and $script:ModelEndpoints.ContainsKey($model)) { $ep = $script:ModelEndpoints[$model] }
+  if ($ep -eq 'responses') { return (Invoke-AgentResponses $model $messages) }
+  return (Invoke-AgentChat $model $messages)
+}
+
+function Invoke-AgentChat($model, $messages) {
+  # Agentic loop on /chat/completions: the model may call tools repeatedly.
+  # Work on a local copy so tool/tool_calls turns never leak into the caller's
+  # conversation (keeps history clean and safe to reuse across model switches).
+  $tools = Get-Tools
+  $work = New-Object System.Collections.Generic.List[object]
+  foreach ($m in $messages) { $work.Add($m) | Out-Null }
+  $nudges = 0
+  for ($step = 0; $step -lt 12; $step++) {
+    try {
+      $resp = Invoke-CopilotApi $script:ChatUrl @{ model=$model; messages=[object[]]$work; tools=$tools; tool_choice='auto' }
+    } catch {
+      if ($step -eq 0) { return (Invoke-Chat $model $messages) }  # model lacks tool support: plain answer
+      return "I ran into a problem talking to the model. Try again or switch model."
+    }
+    $msg = $resp.choices[0].message
+    $calls = @($msg.tool_calls | Where-Object { $_ })
+    if ($calls.Count -eq 0) {
+      # Some models reply with a chatty preamble ("I'll do that...") but emit no
+      # tool call. Don't treat that as the final answer - nudge it to actually act.
+      $promise = ($msg.content -match "(?i)\b(I'?ll|I will|let me|I'?m going to|I am going to|going to|let'?s|first,|step 1|start by|on it|right away|I can do)\b")
+      if ($promise -and $nudges -lt 2) {
+        $nudges++
+        $work.Add(@{ role='assistant'; content=$msg.content }) | Out-Null
+        $work.Add(@{ role='user'; content='Do it now by calling the tools. Do not just describe it.' }) | Out-Null
+        continue
+      }
+      return $msg.content
+    }
+    $work.Add(@{ role='assistant'; content=$msg.content; tool_calls=$calls }) | Out-Null
+    foreach ($c in $calls) {
+      $a = @{}; try { $a = $c.function.arguments | ConvertFrom-Json } catch {}
+      Write-Host "[tool] $($c.function.name)" -ForegroundColor DarkGray
+      $result = Invoke-Tool $c.function.name $a
+      $work.Add(@{ role='tool'; tool_call_id=$c.id; content="$result" }) | Out-Null
+    }
+  }
+  return "I tried several steps but didn't finish. Want me to keep going?"
+}
+
+function Get-ResponsesText($resp) {
+  if ($resp.output_text) { return $resp.output_text }
+  $sb = New-Object System.Text.StringBuilder
+  foreach ($item in @($resp.output)) {
+    if ($item.type -eq 'message') {
+      foreach ($c in @($item.content)) { if ($c.type -eq 'output_text' -and $c.text) { [void]$sb.Append($c.text) } }
+    }
+  }
+  return $sb.ToString()
+}
+
+function Invoke-AgentResponses($model, $messages) {
+  # Agentic loop on /responses (used by the newest GPT models).
+  $tools = Get-ToolsResponses
+  $inp = New-Object System.Collections.Generic.List[object]
+  foreach ($m in $messages) { $inp.Add($m) | Out-Null }
+  for ($step = 0; $step -lt 12; $step++) {
+    try {
+      $resp = Invoke-CopilotApi $script:ResponsesUrl @{ model=$model; input=[object[]]$inp; tools=[object[]]$tools; tool_choice='auto' }
+    } catch {
+      if ($step -eq 0) { return (Invoke-Chat $model $messages) }
+      return "I ran into a problem talking to the model. Try again or switch model."
+    }
+    $fcs = @($resp.output | Where-Object { $_.type -eq 'function_call' })
+    if ($fcs.Count -eq 0) { return (Get-ResponsesText $resp) }
+    foreach ($fc in $fcs) {
+      $a = @{}; try { $a = $fc.arguments | ConvertFrom-Json } catch {}
+      Write-Host "[tool] $($fc.name)" -ForegroundColor DarkGray
+      $result = Invoke-Tool $fc.name $a
+      $inp.Add(@{ type='function_call'; call_id=$fc.call_id; name=$fc.name; arguments=$fc.arguments }) | Out-Null
+      $inp.Add(@{ type='function_call_output'; call_id=$fc.call_id; output="$result" }) | Out-Null
+    }
+  }
+  return "I tried several steps but didn't finish. Want me to keep going?"
 }
 
 function Invoke-Chat($model, $messages) {
@@ -546,11 +681,11 @@ function Main {
   $script:VoiceOk = ($script:UseVosk -or [bool]$reco)
 
   $sys = @{ role = "system"; content = @"
-You are Copilot Voice, a friendly, helpful AI assistant powered by GitHub Copilot.
-You are spoken to through a microphone and your answers are read aloud by text-to-speech,
-so keep replies clear and reasonably concise unless the user asks for detail.
-You can help with coding, explanations, planning, brainstorming, math, and general questions.
-When you must share code, keep it short; it is shown on the user's screen.
+You are Copilot Voice, an agentic AI assistant running ON the user's Windows PC, powered by GitHub Copilot.
+You are spoken to via microphone and replies are read aloud, so keep spoken answers clear and concise.
+You CAN take real actions on this machine using your tools: run_powershell, open, read_file, write_file, list_dir.
+When the user asks you to do something (open an app, find a file, change a setting, run code, search, automate), DO IT with the tools - do not just explain how. Open apps/sites with run_powershell (e.g. Start-Process msedge) or the open tool.
+After acting, tell the user briefly what you did. Only refuse if it is clearly destructive; otherwise act. When sharing code, keep it short; it's on screen.
 "@ }
 
   $messages = New-Object System.Collections.Generic.List[object]
@@ -619,7 +754,7 @@ When you must share code, keep it short; it is shown on the user's screen.
     $messages.Add(@{ role = "user"; content = $text }) | Out-Null
     Write-Host "Copilot is thinking..." -ForegroundColor DarkGray
     $reply = $null
-    try { $reply = Invoke-Chat $model $messages }
+    try { $reply = Invoke-Agent $model $messages }
     catch {
       Write-Host "API error: $($_.Exception.Message)" -ForegroundColor Red
       Speak "Sorry, I hit an error reaching the model."

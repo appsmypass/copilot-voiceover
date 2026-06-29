@@ -1,15 +1,34 @@
 # Copilot Voice
 
-A hands-free voice assistant for Windows, powered by **your** GitHub Copilot
-subscription. Talk to it with your microphone, it talks back, and it can do
-anything Copilot's chat models can. Comes with a built-in model picker.
+A hands-free, **agentic** voice assistant for Windows, powered by **your** GitHub
+Copilot subscription. Talk to it with your microphone, it talks back, and it can
+actually **do things on your PC** — open apps, run commands, read and write files.
+Comes with a built-in model picker.
 
 - 🎙️ **Speak or type** — press ENTER to talk, or just type in the box
 - 🔊 **Talks back** — Windows text-to-speech reads replies aloud
+- 🦾 **Takes action** — opens apps and websites, runs PowerShell, reads/writes files for you
 - 🤖 **Real Copilot models** — GPT-5.x, Claude, Gemini, and more (whatever your plan offers)
 - 🔁 **Model picker** — switch models any time
 - 🔐 **Your account, your sub** — each user signs in with their own GitHub Copilot account
 - 📴 **Offline speech** — voice recognition runs locally (Vosk), no audio leaves your PC
+
+---
+
+## What it can do
+
+Just ask, in plain language. Examples:
+
+- "Open Microsoft Edge and go to github.com"
+- "Create a file on my Desktop called notes.txt that says hello"
+- "What files are in my Downloads folder?"
+- "What's my computer's IP address?"
+- "Make a new folder called Projects in my Documents"
+
+Under the hood it uses tools — `open`, `run_powershell`, `read_file`,
+`write_file`, `list_dir` — so it carries out the request instead of just
+explaining how. It runs on **your** PC with your permissions, so treat it like
+your own command line.
 
 ---
 
@@ -87,5 +106,15 @@ powershell -ExecutionPolicy Bypass -File CopilotVoice.ps1 -Model "gpt-5-mini" -V
 ## Troubleshooting
 
 - **"Please sign in"** — run again and choose sign in; needs an active Copilot plan.
+- **It describes instead of doing** — a few reasoning-heavy models (e.g. some Claude
+  variants) prefer to explain. Say `switch model` and pick `gpt-5.4`, `gpt-5-mini`,
+  `gpt-5.5`, or a Gemini model for reliable actions.
 - **No mic / can't talk** — install Python 3, or use `-NoVosk` and type instead.
 - **No talk-back** — pick another `-Voice`; install voices in Windows Settings → Time & language → Speech.
+
+## Safety
+
+Copilot Voice runs actions on your PC with your account's permissions — the same
+as typing commands yourself. Don't ask it to do anything you wouldn't run
+manually, and review what it's about to do for sensitive operations. Each tool
+action it runs is printed in the window so you can see exactly what happened.
