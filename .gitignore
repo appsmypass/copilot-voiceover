@@ -1,0 +1,11 @@
+# Local Copilot sign-in cache (per-user, DPAPI-encrypted) - never commit
+account.dat
+*.dat
+
+# Vosk speech models + runtime files (downloaded on first run)
+models/
+run/
+
+# Python cache
+__pycache__/
+*.pyc
