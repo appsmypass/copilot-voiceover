@@ -1,5 +1,6 @@
-# Local Copilot sign-in cache (per-user, DPAPI-encrypted) - never commit
+# Local Copilot sign-in cache (per-user, permission-locked) - never commit
 account.dat
+account.json
 *.dat
 
 # Vosk speech models + runtime files (downloaded on first run)
